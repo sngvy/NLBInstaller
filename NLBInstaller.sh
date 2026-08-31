@@ -417,7 +417,7 @@ sys.exit(1)
 
         if ! ufw status | grep -q "$ip"; then
             if classify_ip "$ip"; then
-                ufw insert 1 deny from "$ip" comment 'NLB-Block'
+                ufw prepend deny from "$ip" comment 'NLB-Block'
             fi
         fi
     done
