@@ -9,6 +9,7 @@
 # Beltelecom Smolensk region roaming
 37.214.56.0/21
 # PJSC "Vimpelcom" Dynamic IP Pool for Broadband Customers
+176.14.0.0/15
 176.15.0.0/17
 # PJSC MegaFon Center branch Mobile Network
 178.176.0.0/14
