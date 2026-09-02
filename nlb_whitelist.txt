@@ -16,3 +16,5 @@
 89.113.120.0/21
 # PJSC MegaFon Mobile Pool
 80.253.12.0/22
+# PJSC MegaFon Mobile Subscribers
+188.170.0.0/16
