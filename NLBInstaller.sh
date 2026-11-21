@@ -85,7 +85,8 @@ fi
 BAN_TTL="${BAN_TTL:-604800}"
 OK_TTL="${OK_TTL:-43200}"
 ERR_TTL="${ERR_TTL:-600}"
-MAX_CLASSIFY="${MAX_CLASSIFY:-20}"
+PROXYCHECK_DAILY_LIMIT="${PROXYCHECK_DAILY_LIMIT:-1000}"
+IPAPI_MIN_INTERVAL="${IPAPI_MIN_INTERVAL:-2}"
 MAX_PENDING="${MAX_PENDING:-10000}"
 WL_INTERVAL="${WL_INTERVAL:-3600}"
 LOG_FILE="${LOG_FILE:-/usr/local/x-ui/access.log}"
@@ -239,7 +240,7 @@ echo -e "${B_YELLOW}Резервные копии на время миграци
 {
     echo "# Конфигурация NLB. Файл содержит ключи, права 600."
     echo "# BAN_TTL: срок бана, секунды. OK_TTL: срок кэша мобильных адресов."
-    echo "# ERR_TTL: срок кэша при недоступности сервисов. MAX_CLASSIFY: проверок за один запуск."
+    echo "# ERR_TTL: срок кэша при недоступности сервисов."
     printf 'MODE=%q\n' "$MODE"
     printf 'SOURCE_MODE=%q\n' "$SOURCE_MODE"
     printf 'API_KEY=%q\n' "$API_KEY"
@@ -248,7 +249,8 @@ echo -e "${B_YELLOW}Резервные копии на время миграци
     printf 'BAN_TTL=%q\n' "$BAN_TTL"
     printf 'OK_TTL=%q\n' "$OK_TTL"
     printf 'ERR_TTL=%q\n' "$ERR_TTL"
-    printf 'MAX_CLASSIFY=%q\n' "$MAX_CLASSIFY"
+    printf 'PROXYCHECK_DAILY_LIMIT=%q\n' "$PROXYCHECK_DAILY_LIMIT"
+    printf 'IPAPI_MIN_INTERVAL=%q\n' "$IPAPI_MIN_INTERVAL"
     printf 'MAX_PENDING=%q\n' "$MAX_PENDING"
     printf 'WL_INTERVAL=%q\n' "$WL_INTERVAL"
     printf 'LOG_FILE=%q\n' "$LOG_FILE"
@@ -296,7 +298,8 @@ PROXY="${PROXY:-}"
 BAN_TTL="${BAN_TTL:-604800}"
 OK_TTL="${OK_TTL:-43200}"
 ERR_TTL="${ERR_TTL:-600}"
-MAX_CLASSIFY="${MAX_CLASSIFY:-20}"
+PROXYCHECK_DAILY_LIMIT="${PROXYCHECK_DAILY_LIMIT:-1000}"
+IPAPI_MIN_INTERVAL="${IPAPI_MIN_INTERVAL:-2}"
 MAX_PENDING="${MAX_PENDING:-10000}"
 WL_INTERVAL="${WL_INTERVAL:-3600}"
 LOG_FILE="${LOG_FILE:-/usr/local/x-ui/access.log}"
@@ -306,6 +309,7 @@ STATE_DIR="/var/lib/nlb"
 SAVE_FILE="$STATE_DIR/ipsets.save"
 LOG_STATE="$STATE_DIR/log.state"
 PENDING="$STATE_DIR/pending.list"
+API_LIMIT_STATE="$STATE_DIR/api-limits.state"
 WL_STAMP="$STATE_DIR/wl.checked"
 WL_APPLIED="$STATE_DIR/wl.applied.sha256"
 DECISIONS_LOG="/var/log/nlb_decisions.log"
@@ -836,10 +840,79 @@ filter_candidates_batch() {
     ' "$known" "$input" > "$output"
 }
 
+# ------------------------------------------------------------------
+# Равномерное расходование квоты API для обоих режимов источника IP.
+# Накопление: 1000 запросов за 86400 секунд, не более двух в запасе.
+# Суточный счётчик дополнительно защищает от превышения 1000 запросов.
+# Состояние сохраняется до запроса: ошибки и перезапуски не дают
+# повторно потратить ту же квоту. Файл общий для xray и conntrack.
+# ------------------------------------------------------------------
+load_api_limits() {
+    local now day
+    now=$(date +%s)
+    day=$(date -u +%Y%m%d)
+    API_LAST="$now"
+    API_CREDIT=86400
+    API_DAY="$day"
+    API_USED=0
+    API_IPAPI_LAST=0
+    if [ -r "$API_LIMIT_STATE" ]; then
+        read -r API_LAST API_CREDIT API_DAY API_USED API_IPAPI_LAST < "$API_LIMIT_STATE"
+    fi
+    [[ "$API_LAST" =~ ^[0-9]+$ ]] || API_LAST="$now"
+    [[ "$API_CREDIT" =~ ^[0-9]+$ ]] || API_CREDIT=0
+    [[ "$API_USED" =~ ^[0-9]+$ ]] || API_USED=0
+    [[ "$API_IPAPI_LAST" =~ ^[0-9]+$ ]] || API_IPAPI_LAST=0
+    if [ "$API_DAY" != "$day" ]; then
+        API_DAY="$day"
+        API_USED=0
+    fi
+    # Если системное время сдвинулось назад, кредит не увеличиваем.
+    if [ "$now" -gt "$API_LAST" ]; then
+        API_CREDIT=$((API_CREDIT + (now - API_LAST) * PROXYCHECK_DAILY_LIMIT))
+        [ "$API_CREDIT" -gt 172800 ] && API_CREDIT=172800
+    fi
+    API_LAST="$now"
+}
+
+save_api_limits() {
+    printf '%s %s %s %s %s\n' "$API_LAST" "$API_CREDIT" "$API_DAY" "$API_USED" "$API_IPAPI_LAST" > "$API_LIMIT_STATE.tmp" || return 1
+    chmod 600 "$API_LIMIT_STATE.tmp"
+    mv -f "$API_LIMIT_STATE.tmp" "$API_LIMIT_STATE"
+}
+
+reserve_api_request() {
+    local now day pause
+    now=$(date +%s)
+    day=$(date -u +%Y%m%d)
+    if [ "$API_DAY" != "$day" ]; then
+        API_DAY="$day"
+        API_USED=0
+    fi
+    if [ "$now" -gt "$API_LAST" ]; then
+        API_CREDIT=$((API_CREDIT + (now - API_LAST) * PROXYCHECK_DAILY_LIMIT))
+        [ "$API_CREDIT" -gt 172800 ] && API_CREDIT=172800
+    fi
+    API_LAST="$now"
+    [ "$API_USED" -lt "$PROXYCHECK_DAILY_LIMIT" ] || return 1
+    [ "$API_CREDIT" -ge 86400 ] || return 1
+    # Не превышаем 45 запросов/мин к ip-api: интервал минимум 2 с.
+    pause=$((IPAPI_MIN_INTERVAL - (now - API_IPAPI_LAST)))
+    if [ "$pause" -gt 0 ]; then sleep "$pause"; fi
+    now=$(date +%s)
+    API_LAST="$now"
+    API_IPAPI_LAST="$now"
+    API_CREDIT=$((API_CREDIT - 86400))
+    API_USED=$((API_USED + 1))
+    save_api_limits || return 1
+    return 0
+}
+
 cmd_update() {
     local chunk="$TMP_DIR/chunk" cand="$TMP_DIR/cand" pend_new="$TMP_DIR/pend.new"
-    local ip processed=0 banned=0 total=0
+    local ip processed=0 banned=0 total=0 quota_exhausted=0
 
+    load_api_limits
     create_sets || return 1
     refresh_whitelist || return 1
     if [ "$MODE" = "iptables" ]; then ensure_iptables_rules || return 1; fi
@@ -858,12 +931,14 @@ cmd_update() {
     while read -r ip <&3; do
         sets_for "$ip"
         total=$((total + 1))
-        if [ "$processed" -ge "$MAX_CLASSIFY" ]; then
+        # Whitelist может содержать подсети CIDR, поэтому проверяем через ipset.
+        ipset test "$S_WL" "$ip" &>/dev/null && continue
+        # Если квота исчерпана, оставляем адрес на следующий запуск.
+        if [ "$quota_exhausted" -eq 1 ] || ! reserve_api_request; then
+            quota_exhausted=1
             echo "$ip" >> "$pend_new"
             continue
         fi
-        # Whitelist может содержать подсети CIDR, поэтому проверяем через ipset.
-        ipset test "$S_WL" "$ip" &>/dev/null && continue
         processed=$((processed + 1))
         classify_ip "$ip"
         ipset test "$S_WL" "$ip" &>/dev/null && continue
@@ -898,7 +973,6 @@ case "$CMD" in
     import-bans)         cmd_import_bans ;;
     *) echo "Использование: $0 [update|restore|whitelist|ensure-rules|ensure-source-rules|reset-source-rules|import-bans]"; exit 1 ;;
 esac
-
 UPDATER_EOF
 
 chmod 700 "$S"
